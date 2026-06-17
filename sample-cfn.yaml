@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Production application stack — ECS Fargate API + background workers,
+  Aurora PostgreSQL, ElastiCache Redis, ALB, and Secrets Manager.
+  Mirrors the local docker-compose.yml but deployed on AWS.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [staging, production]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.small
+  ApiTaskCpu:
+    Type: Number
+    Default: 512
+  ApiTaskMemory:
+    Type: Number
+    Default: 1024
+  WorkerDesiredCount:
+    Type: Number
+    Default: 2
+
+Resources:
+
+  # ── Secrets ──────────────────────────────────────────────────────────────────
+
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Environment}/app/db-credentials"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "appuser"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+  RabbitSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Environment}/app/rabbitmq-credentials"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "appuser"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+
+  # ── ECS Cluster ───────────────────────────────────────────────────────────────
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${Environment}-app-cluster"
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # ── Load Balancer ─────────────────────────────────────────────────────────────
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS from internet
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Environment}-app-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref PublicSubnets
+      SecurityGroups: [!Ref ALBSecurityGroup]
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ── Aurora PostgreSQL ─────────────────────────────────────────────────────────
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for Aurora cluster
+      SubnetIds: !Ref PrivateSubnets
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: "16.2"
+      DatabaseName: appdb
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      StorageEncrypted: true
+      DeletionProtection: true
+      BackupRetentionPeriod: 7
+
+  AuroraPrimaryInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      PubliclyAccessible: false
+
+  # ── ElastiCache Redis ─────────────────────────────────────────────────────────
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Private subnets for Redis
+      SubnetIds: !Ref PrivateSubnets
+
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: !Sub "${Environment} Redis cache"
+      CacheNodeType: !Ref CacheNodeType
+      Engine: redis
+      EngineVersion: "7.1"
+      NumCacheClusters: 2
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+
+  # ── ECS Task Definitions ──────────────────────────────────────────────────────
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DBSecret
+                  - !Ref RabbitSecret
+
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Environment}-api"
+      Cpu: !Ref ApiTaskCpu
+      Memory: !Ref ApiTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/myapp/api:latest"
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: LOG_LEVEL
+              Value: info
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Ref DBSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/ecs/${Environment}/api"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -f http://localhost:8080/healthz || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Environment}-worker"
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/myapp/worker:latest"
+          Secrets:
+            - Name: RABBIT_PASSWORD
+              ValueFrom: !Ref RabbitSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/ecs/${Environment}/worker"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  # ── ECS Services ──────────────────────────────────────────────────────────────
+
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ApiTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnets
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8080
+          TargetGroupArn: !Ref ALBTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: !Ref WorkerDesiredCount
+      LaunchType: FARGATE
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnets
+          AssignPublicIp: DISABLED
+
+Outputs:
+  LoadBalancerDNS:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Description: Public endpoint for the application
+  DBClusterEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Description: Aurora writer endpoint
+  CacheEndpoint:
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
+    Description: Redis primary endpoint
